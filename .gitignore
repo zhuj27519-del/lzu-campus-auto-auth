@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+logs/
+*.log
+*.log.*
+work/
+.env
+.env.*
+*.har
+playwright-report/
+test-results/

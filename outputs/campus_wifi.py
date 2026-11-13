@@ -127,7 +127,18 @@ def pause(seconds, stopped):
         time.sleep(.2)
     return not stopped()
 
-def ensure_campus_wifi(stopped):
+def campus_wifi_connected():
+    wlan = None
+    try:
+        wlan = Wlan()
+        return any(wlan.current(interface) in CAMPUS for interface in wlan.interfaces())
+    except Exception:
+        return False
+    finally:
+        if wlan:
+            wlan.close()
+
+def ensure_campus_wifi(stopped, online=None):
     """Called only after repeated internet failures; connect saved campus profiles."""
     wlan = None
     try:
@@ -152,6 +163,13 @@ def ensure_campus_wifi(stopped):
         candidate, interface, current = max(choices, key=lambda x: (x[0].signal, x[0].ssid == x[2]))
         if stopped():
             return False
+        # Scanning can take time; do not disrupt a connection restored meanwhile.
+        if online is not None and online():
+            log.info('WIFI_CONNECT_SKIPPED: internet already restored')
+            return True
+        if wlan.current(interface) not in (None, *CAMPUS):
+            log.info('WIFI_CONNECT_SKIPPED: interface changed to another network')
+            return True
         # Also request connection to the current SSID: handles a stale association.
         log.info('WIFI_CONNECT ssid=%s signal=%s%%', candidate.ssid.decode('ascii'), candidate.signal)
         wlan.connect(interface, candidate)

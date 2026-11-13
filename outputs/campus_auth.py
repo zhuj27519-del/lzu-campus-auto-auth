@@ -18,8 +18,9 @@ import win32con
 import win32cred
 import win32event
 import win32security
+from campus_process import run_bounded
 from playwright.sync_api import sync_playwright
-from campus_wifi import ensure_campus_wifi
+from campus_wifi import ensure_campus_wifi, campus_wifi_connected
 
 ROOT = Path(__file__).resolve().parent
 TARGET = 'CampusAutoAuth/10.10.0.166/eLearning/v1'
@@ -56,9 +57,24 @@ def probe(spec):
     except Exception:
         return False
 
+def _probe_round():
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(PROBES))
+    futures = [pool.submit(probe, spec) for spec in PROBES]
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=5):
+            if future.result():
+                return True
+        return False
+    except concurrent.futures.TimeoutError:
+        return False
+    finally:
+        # _check exits immediately with os._exit; its Job Object cleans up a
+        # resolver that is still stuck. A healthy provider must win immediately.
+        pool.shutdown(wait=False, cancel_futures=True)
+
 def internet_ok():
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROBES)) as pool:
-        return any(list(pool.map(probe, PROBES)))
+    # socket timeouts do not bound DNS resolution on Windows.
+    return run_bounded([sys.executable, Path(__file__).resolve(), '_check'], 7, cwd=ROOT) == 0
 
 def read_credentials():
     try:
@@ -71,22 +87,26 @@ def read_credentials():
     password = blob.decode('utf-16-le') if isinstance(blob, bytes) else blob
     return entry['UserName'], password
 
-def configure_logging():
+def configure_logging(name='monitor'):
     folder = ROOT / 'logs'
     folder.mkdir(exist_ok=True)
-    handler = RotatingFileHandler(folder / 'monitor.log', maxBytes=1024*1024, backupCount=5, encoding='utf-8')
+    handler = RotatingFileHandler(folder / (name + '.log'), maxBytes=1024*1024, backupCount=5, encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     log.setLevel(logging.INFO)
     log.addHandler(handler)
 
 def prepare_form(page):
     # Selectors confirmed from the live SRun portal, 2026-11-12.
+    log.info('FORM_STAGE navigate')
     page.goto(PORTAL, wait_until='domcontentloaded', timeout=20000)
+    log.info('FORM_STAGE wait_account_tab')
     page.locator('.tab-item[data="account"]').wait_for(state='visible', timeout=12000)
     page.locator('.tab-item[data="account"]').click()
-    page.locator('#username').wait_for(state='visible')
-    page.locator('.domain.custom-select .select-selected').click()
-    page.locator('.domain.custom-select .select-items [data-value="@study"]').click()
+    log.info('FORM_STAGE select_domain')
+    page.locator('#username').wait_for(state='visible', timeout=10000)
+    # The actual login handler reads this select. Its decorative menu is only
+    # initialized on window.load and can miss clicks before slow assets finish.
+    page.locator('select.domain').select_option(value='@study', force=True, timeout=10000)
     if page.locator('select.domain').input_value() != '@study':
         raise RuntimeError('domain_mismatch')
     if page.locator('#captcha').is_visible():
@@ -95,40 +115,67 @@ def prepare_form(page):
         page.locator('label[for="remember"]').click()
     if page.locator('label[for="protocol"]').is_visible() and not page.locator('#protocol').is_checked():
         page.locator('label[for="protocol"]').click()
+    log.info('FORM_STAGE ready')
     return True
 
+def submit_form(page, username, password):
+    log.info('LOGIN_STAGE fill_form')
+    page.locator('#username').fill(username)
+    page.locator('#password').fill(password)
+    log.info('LOGIN_STAGE submit')
+    page.locator('#login-account').click(timeout=10000)
+
 def login_once(stopped):
+    result = run_bounded([sys.executable, Path(__file__).resolve(), '_login'], 75, stopped, ROOT)
+    if result is None:
+        log.warning('LOGIN_CANCELLED' if stopped() else 'LOGIN_DEADLINE_EXCEEDED')
+    return result == 0
+
+
+def _login_in_process(stopped):
+    try:
+        return _login_once(stopped)
+    except Exception as exc:
+        # Only a fixed category, never the exception message, URL or fill value.
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+        category = 'browser_timeout' if isinstance(exc, BrowserTimeout) else 'operation_failed'
+        log.warning('LOGIN_ERROR category=%s', category)
+        return False
+
+def _login_once(stopped):
+    log.info('LOGIN_STAGE credentials')
     credentials = read_credentials()
     if not credentials:
         log.warning('CREDENTIALS_MISSING: run setup')
         return False
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel='msedge', headless=True)
-        try:
-            context = browser.new_context(service_workers='block')
-            # Never forward credentials to another host; no saved profile, trace or screenshots.
-            context.route('**/*', lambda route: route.continue_() if urllib.parse.urlparse(route.request.url).hostname == '10.10.0.166' else route.abort())
-            page = context.new_page()
-            page.set_default_timeout(10000)
-            if not prepare_form(page):
-                log.warning('CAPTCHA_REQUIRED: manual portal login required')
-                return False
+    playwright = sync_playwright().start()
+    log.info('LOGIN_STAGE edge_launch')
+    browser = playwright.chromium.launch(channel='msedge', headless=True)
+    try:
+        context = browser.new_context(service_workers='block')
+        # Never forward credentials to another host; no saved profile, trace or screenshots.
+        context.route('**/*', lambda route: route.continue_() if urllib.parse.urlparse(route.request.url).hostname == '10.10.0.166' else route.abort())
+        page = context.new_page()
+        page.set_default_timeout(10000)
+        log.info('LOGIN_STAGE portal_form')
+        if not prepare_form(page):
+            log.warning('CAPTCHA_REQUIRED: manual portal login required')
+            return False
+        if stopped():
+            return False
+        submit_form(page, *credentials)
+        log.info('LOGIN_STAGE verify_internet')
+        for _ in range(6):
             if stopped():
                 return False
-            page.locator('#username').fill(credentials[0])
-            page.locator('#password').fill(credentials[1])
-            page.locator('#login-account').click()
-            for _ in range(6):
-                if stopped():
-                    return False
-                page.wait_for_timeout(2500)
-                if internet_ok():
-                    log.info('LOGIN_VERIFIED')
-                    return True
-            return False
-        finally:
-            credentials = None
-            browser.close()
+            page.wait_for_timeout(2500)
+            if internet_ok():
+                log.info('LOGIN_VERIFIED')
+                return True
+        log.warning('LOGIN_NOT_VERIFIED')
+        return False
+    finally:
+        credentials = None
 
 class RetryPolicy:
     def __init__(self):
@@ -140,6 +187,7 @@ class RetryPolicy:
         self.misses = 0 if online else self.misses + 1
         if online:
             self.failures = 0
+            self.next_attempt = 0.0
         return not online and self.misses >= 2 and now >= self.next_attempt
 
     def result(self, success, now):
@@ -153,7 +201,19 @@ def recover_connection(stopped):
         return False
     if internet_ok():
         return True
-    if not ensure_campus_wifi(stopped) or stopped():
+    if campus_wifi_connected():
+        log.info('RECOVERY_PORTAL_FIRST: campus Wi-Fi already connected')
+        if login_once(stopped):
+            return True
+        if stopped():
+            return False
+        # One authentication submission per recovery attempt. Reconnect as fallback,
+        # then let the normal backoff schedule another authentication if necessary.
+        log.info('RECOVERY_WIFI_FALLBACK')
+        if not ensure_campus_wifi(stopped, online=internet_ok) or stopped():
+            return False
+        return internet_ok()
+    if not ensure_campus_wifi(stopped, online=internet_ok) or stopped():
         return False
     if internet_ok():
         return True
@@ -173,7 +233,7 @@ def monitor():
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     pending = None
     previous = None
-    log.info('MONITOR_STARTED interval=15s wifi_recovery=enabled')
+    log.info('MONITOR_STARTED version=2 interval=15s bounded_workers=enabled')
     try:
         while not stopped():
             tick = time.monotonic()
@@ -291,6 +351,14 @@ def main():
     os.environ.pop('PWDEBUG',None)
     command = sys.argv[1] if len(sys.argv)>1 else 'status'
     if command == 'setup': setup()
+    elif command == '_check': os._exit(0 if _probe_round() else 2)
+    elif command == '_login':
+        configure_logging('authentication')
+        result = _login_in_process(lambda: False)
+        for handler in log.handlers:
+            handler.flush()
+        # The parent Job Object owns Edge/driver cleanup; Playwright.close may hang.
+        os._exit(0 if result else 2)
     elif command == 'run': monitor()
     elif command == 'start': start(); print('Background start requested.')
     elif command == 'stop': stop(); print('Stopped.')

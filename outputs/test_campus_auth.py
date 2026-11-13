@@ -1,15 +1,29 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import urllib.error
+import threading
 import campus_auth as app
 
 class ConnectivityTests(unittest.TestCase):
+    def test_success_does_not_wait_for_stalled_provider(self):
+        release=threading.Event()
+        def delayed(spec):
+            if spec==app.PROBES[0]:
+                release.wait(3)
+                return False
+            return True
+        try:
+            with patch.object(app,'probe',side_effect=delayed):
+                self.assertTrue(app._probe_round())
+                self.assertFalse(release.is_set())
+        finally:
+            release.set()
     def test_single_provider_outage_is_online(self):
         with patch.object(app,'probe',side_effect=[False,True,False]):
-            self.assertTrue(app.internet_ok())
+            self.assertTrue(app._probe_round())
     def test_all_fail_is_offline(self):
         with patch.object(app,'probe',return_value=False):
-            self.assertFalse(app.internet_ok())
+            self.assertFalse(app._probe_round())
     def test_captive_portal_body_is_rejected(self):
         response=MagicMock()
         response.status=200

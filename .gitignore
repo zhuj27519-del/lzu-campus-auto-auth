@@ -11,3 +11,5 @@ work/
 *.har
 playwright-report/
 test-results/
+test-result.txt
+test-details.txt
